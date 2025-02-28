@@ -1,9 +1,8 @@
 {
   "version": 2,
-  "routes": [
-    {
-      "src": "/(.*)",
-      "dest": "/index.js"
+  "functions": {
+    "index.js": {
+      "runtime": "nodejs18.x"
     }
-  ]
+  }
 }
