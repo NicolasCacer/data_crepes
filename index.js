@@ -12,92 +12,103 @@ app.use(cors());
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: "*", // Allow connections from any origin
+    origin: "*", // Permite conexiones de cualquier origen
   },
 });
 
-// Initialize Firebase
+// Inicializar Firebase
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
 const db = admin.firestore();
 
-// This array holds the temporary (ephemeral) registration data shared among all clients.
-let ephemeralRegistros = [];
+// Definimos las colecciones de interés
+const collections = ["arribo", "mesas", "productos"];
 
-// Utility: (For the view page) Fetch all persisted registros from Firestore.
-async function fetchAllPersistedRegistros() {
-  const snapshot = await db.collection("registros").get();
+// Estado efímero para cada colección
+let ephemeralData = {
+  arribo: [],
+  mesas: [],
+  productos: [],
+};
+
+// Utilidad para obtener todos los documentos persistidos de una colección
+async function fetchAllPersistedDocs(collectionName) {
+  const snapshot = await db.collection(collectionName).get();
   return snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
 }
 
+// Socket.IO: eventos por conexión
 io.on("connection", (socket) => {
   console.log("Usuario conectado:", socket.id);
 
-  // When a client connects to the registration page, send them the current ephemeral state.
-  socket.on("get_registros", () => {
-    socket.emit("update_registros", ephemeralRegistros);
-  });
+  // Para cada colección se registran los eventos correspondientes
+  collections.forEach((collection) => {
+    // Obtener datos efímeros
+    socket.on("get_" + collection, () => {
+      socket.emit("update_" + collection, ephemeralData[collection]);
+    });
 
-  // When a new row is added (e.g., via "Agregar Fila")
-  socket.on("nuevo_registro", (data) => {
-    // data should include a unique id (generated on the client)
-    ephemeralRegistros.push(data);
-    io.emit("update_registros", ephemeralRegistros);
-  });
+    // Agregar un nuevo registro efímero
+    socket.on("nuevo_" + collection, (data) => {
+      ephemeralData[collection].push(data);
+      io.emit("update_" + collection, ephemeralData[collection]);
+    });
 
-  // When a field (description, observation, times) is updated in a row
-  socket.on("actualizar_registro", ({ id, data }) => {
-    ephemeralRegistros = ephemeralRegistros.map((registro) =>
-      registro.id === id ? { ...registro, ...data } : registro
-    );
-    io.emit("update_registros", ephemeralRegistros);
-  });
+    // Actualizar un registro efímero
+    socket.on("actualizar_" + collection, ({ id, data }) => {
+      ephemeralData[collection] = ephemeralData[collection].map((registro) =>
+        registro.id === id ? { ...registro, ...data } : registro
+      );
+      io.emit("update_" + collection, ephemeralData[collection]);
+    });
 
-  // When a row is "sent" (Enviar button): save the data to Firestore and remove it from ephemeral state.
-  socket.on("guardar_registro", async ({ id, data }) => {
-    try {
-      await db.collection("registros").add(data);
-      // Remove the row from the ephemeral state after saving.
-      ephemeralRegistros = ephemeralRegistros.filter(
+    // Guardar el registro efímero en Firestore y eliminarlo del estado efímero
+    socket.on("guardar_" + collection, async ({ id, data }) => {
+      try {
+        await db.collection(collection).add(data);
+        ephemeralData[collection] = ephemeralData[collection].filter(
+          (registro) => registro.id !== id
+        );
+        io.emit("update_" + collection, ephemeralData[collection]);
+      } catch (error) {
+        console.error(`Error al guardar en ${collection}:`, error);
+      }
+    });
+
+    // Eliminar un registro del estado efímero
+    socket.on("eliminar_" + collection, (id) => {
+      if (!id) {
+        console.error("Error: ID es indefinido o vacío");
+        return;
+      }
+      ephemeralData[collection] = ephemeralData[collection].filter(
         (registro) => registro.id !== id
       );
-      io.emit("update_registros", ephemeralRegistros);
-    } catch (error) {
-      console.error("Error saving registro:", error);
-    }
-  });
+      io.emit("update_" + collection, ephemeralData[collection]);
+    });
 
-  // When a row is deleted from the registration table.
-  socket.on("eliminar_registro", (id) => {
-    if (!id) {
-      console.error("Error: ID is undefined or empty");
-      return;
-    }
-    ephemeralRegistros = ephemeralRegistros.filter(
-      (registro) => registro.id !== id
-    );
-    io.emit("update_registros", ephemeralRegistros);
-  });
+    // Obtener documentos persistidos de Firestore
+    socket.on("get_persisted_" + collection, async () => {
+      const docs = await fetchAllPersistedDocs(collection);
+      socket.emit("update_persisted_" + collection, docs);
+    });
 
-  socket.on("get_persisted_registros", async () => {
-    const registros = await fetchAllPersistedRegistros();
-    socket.emit("update_persisted_registros", registros);
-  });
-
-  socket.on("eliminar_registro_persistido", async (id) => {
-    if (!id) {
-      console.error("Error: ID is undefined or empty");
-      return;
-    }
-    try {
-      await db.collection("registros").doc(String(id)).delete();
-      const registros = await fetchAllPersistedRegistros();
-      io.emit("update_persisted_registros", registros);
-    } catch (error) {
-      console.error("Error deleting persisted registro:", error);
-    }
+    // Eliminar un documento persistido de Firestore
+    socket.on("eliminar_registro_persistido_" + collection, async (id) => {
+      if (!id) {
+        console.error("Error: ID es indefinido o vacío");
+        return;
+      }
+      try {
+        await db.collection(collection).doc(String(id)).delete();
+        const docs = await fetchAllPersistedDocs(collection);
+        io.emit("update_persisted_" + collection, docs);
+      } catch (error) {
+        console.error(`Error al eliminar documento de ${collection}:`, error);
+      }
+    });
   });
 
   socket.on("disconnect", () => {
@@ -105,7 +116,56 @@ io.on("connection", (socket) => {
   });
 });
 
+// Endpoints REST para cada colección (POST, GET y DELETE)
+
+// GET: Obtener todos los documentos de una colección
+app.get("/api/:collection", async (req, res) => {
+  const { collection } = req.params;
+  if (!collections.includes(collection)) {
+    return res.status(400).json({ error: "Colección inválida" });
+  }
+  try {
+    const snapshot = await db.collection(collection).get();
+    const docs = snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
+    res.status(200).json(docs);
+  } catch (error) {
+    console.error(`Error obteniendo documentos de ${collection}:`, error);
+    res.status(500).json({ error: "Error al obtener los documentos" });
+  }
+});
+
+// POST: Crear un nuevo documento en una colección
+app.post("/api/:collection", async (req, res) => {
+  const { collection } = req.params;
+  if (!collections.includes(collection)) {
+    return res.status(400).json({ error: "Colección inválida" });
+  }
+  const data = req.body;
+  try {
+    const docRef = await db.collection(collection).add(data);
+    res.status(201).json({ id: docRef.id, ...data });
+  } catch (error) {
+    console.error(`Error creando documento en ${collection}:`, error);
+    res.status(500).json({ error: "Error al crear el documento" });
+  }
+});
+
+// DELETE: Eliminar un documento de una colección
+app.delete("/api/:collection/:id", async (req, res) => {
+  const { collection, id } = req.params;
+  if (!collections.includes(collection)) {
+    return res.status(400).json({ error: "Colección inválida" });
+  }
+  try {
+    await db.collection(collection).doc(String(id)).delete();
+    res.status(200).json({ message: "Documento eliminado correctamente" });
+  } catch (error) {
+    console.error(`Error eliminando documento de ${collection}:`, error);
+    res.status(500).json({ error: "Error al eliminar el documento" });
+  }
+});
+
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () =>
-  console.log(`Servidor WebSocket en http://localhost:${PORT}`)
+  console.log(`Servidor corriendo en http://localhost:${PORT}`)
 );
