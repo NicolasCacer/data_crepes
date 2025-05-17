@@ -15,7 +15,7 @@ admin.initializeApp({
 const db = admin.firestore();
 
 // Colecciones válidas
-const collections = ["arribos1", "productos1"];
+const collections = ["arribos1", "productos1", "registros"];
 
 // Estado efímero (en memoria)
 let ephemeralData = {
